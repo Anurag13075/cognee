@@ -1,0 +1,333 @@
+"""Google Tasks connector for cognee — a ``dlt`` source that turns task lists into memory.
+
+Sync Google Tasks items into cognee, incrementally and with forget-on-delete.
+This source is meant to be handed to :func:`cognee.remember` directly:
+
+    import cognee
+    from cognee.tasks.ingestion.connectors import google_tasks_source
+
+    await cognee.remember(
+        google_tasks_source(),
+        dataset_name="my_google_tasks",
+        primary_key="id",
+        write_disposition="merge",
+        max_rows_per_table=0,
+    )
+
+The task rows are ingested as documents so their titles, notes, due dates, and
+status can flow through the regular chunking + cognify pipeline.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
+from typing import Any
+
+from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion import dlt_utils
+from cognee.tasks.ingestion.dlt_utils import DOCUMENT_SOURCE_ATTR
+
+logger = get_logger("google_tasks_connector")
+
+GOOGLE_TASKS_READONLY_SCOPE = ["https://www.googleapis.com/auth/tasks.readonly"]
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_rfc3339(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _task_key(tasklist_id: str, task_id: str | None) -> str:
+    return f"{tasklist_id}:{task_id or ''}"
+
+
+def _task_document(task: dict[str, Any], tasklist_title: str) -> str:
+    fields = (
+        ("Task list", tasklist_title),
+        ("Status", task.get("status") or "needsAction"),
+        ("Due", task.get("due")),
+        ("Updated", task.get("updated")),
+        ("Completed", task.get("completed")),
+        ("Parent", task.get("parent")),
+        ("URL", task.get("selfLink")),
+    )
+    lines = [f"{label}: {value}" for label, value in fields if value]
+    notes = (task.get("notes") or "").strip()
+    if notes:
+        lines.extend(["", notes])
+    title = (task.get("title") or "").strip()
+    if title:
+        lines.insert(0, f"Title: {title}")
+    return "\n".join(lines).strip()
+
+
+def _task_to_row(task: dict[str, Any], tasklist_id: str, tasklist_title: str) -> dict[str, Any] | None:
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        return None
+
+    if task.get("deleted") is True:
+        return {"id": _task_key(tasklist_id, task_id), "_deleted": True}
+
+    return {
+        "id": _task_key(tasklist_id, task_id),
+        "title": task.get("title") or "",
+        "content": _task_document(task, tasklist_title),
+        "tasklist_id": tasklist_id,
+        "tasklist_title": tasklist_title,
+        "status": task.get("status") or "needsAction",
+        "due": task.get("due"),
+        "completed": task.get("completed"),
+        "updated": task.get("updated"),
+        "self_link": task.get("selfLink"),
+        "parent": task.get("parent"),
+        "notes": task.get("notes"),
+        "hidden": task.get("hidden"),
+        "deleted": bool(task.get("deleted")),
+        "_deleted": False,
+    }
+
+
+def build_tasks_service(
+    *,
+    credentials_path: str = "credentials.json",
+    token_path: str = "token.json",
+) -> Any:
+    """Build an authenticated Google Tasks API client via OAuth2 installed-app flow."""
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError as exc:  # pragma: no cover - depends on optional extra
+        raise ImportError(
+            'The Google Tasks connector requires the "google-tasks" extra. Install it with:\n'
+            '    pip install "cognee[google-tasks]"\n'
+            "(provides google-api-python-client, google-auth, google-auth-oauthlib)."
+        ) from exc
+
+    creds = None
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, GOOGLE_TASKS_READONLY_SCOPE)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(credentials_path):
+                raise FileNotFoundError(
+                    f"Google Tasks OAuth client secret not found at '{credentials_path}'. "
+                    "Download an OAuth 2.0 Client ID (Desktop app) from the Google Cloud "
+                    "Console and point credentials_path at the JSON file."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, GOOGLE_TASKS_READONLY_SCOPE)
+            creds = flow.run_local_server(port=0)
+        fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as token_file:
+            token_file.write(creds.to_json())
+        os.chmod(token_path, 0o600)
+
+    return build("tasks", "v1", credentials=creds, cache_discovery=False)
+
+
+def build_tasks_service_from_access_token(access_token: str) -> Any:
+    """Build a Tasks client from a short-lived token supplied by a host."""
+    try:
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError('The Google Tasks connector requires the "google-tasks" extra.') from exc
+
+    credentials = Credentials(token=access_token, scopes=GOOGLE_TASKS_READONLY_SCOPE)
+    return build("tasks", "v1", credentials=credentials, cache_discovery=False)
+
+
+def _list_tasklists(service: Any) -> list[dict[str, Any]]:
+    tasklists: list[dict[str, Any]] = []
+    page_token = None
+    while True:
+        request = service.tasklists().list(pageToken=page_token, maxResults=100)
+        response = request.execute()
+        tasklists.extend(response.get("items", []) or [])
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return tasklists
+
+
+def _list_tasks(
+    service: Any,
+    tasklist_id: str,
+    *,
+    updated_min: str | None = None,
+    show_deleted: bool = True,
+    show_hidden: bool = True,
+) -> Iterator[dict[str, Any]]:
+    page_token = None
+    while True:
+        request = service.tasks().list(
+            tasklist=tasklist_id,
+            maxResults=100,
+            pageToken=page_token,
+            showDeleted=show_deleted,
+            showHidden=show_hidden,
+            updatedMin=updated_min,
+        )
+        response = request.execute()
+        for task in response.get("items", []) or []:
+            yield task
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+
+def full_backfill(service: Any, state: dict[str, Any], stats: dict[str, int] | None = None) -> Iterator[dict[str, Any]]:
+    if stats is None:
+        stats = {}
+    stats.clear()
+    stats.update(scanned=0, skipped=0, failed=0, deleted=0)
+
+    present: set[str] = set()
+    known_ids = set(state.get("known_ids", []))
+
+    for tasklist in _list_tasklists(service):
+        tasklist_id = tasklist.get("id")
+        tasklist_title = tasklist.get("title") or ""
+        if not tasklist_id:
+            continue
+        for task in _list_tasks(service, tasklist_id, show_deleted=True, show_hidden=True):
+            stats["scanned"] = stats.get("scanned", 0) + 1
+            row = _task_to_row(task, tasklist_id, tasklist_title)
+            if row is None:
+                stats["skipped"] = stats.get("skipped", 0) + 1
+                continue
+            if row.get("_deleted"):
+                stats["deleted"] = stats.get("deleted", 0) + 1
+                continue
+            present.add(row["id"])
+            yield row
+
+    for row_id in sorted(known_ids - present):
+        stats["deleted"] = stats.get("deleted", 0) + 1
+        yield {"id": row_id, "_deleted": True}
+
+    state["known_ids"] = sorted(present)
+    state["last_updated_min"] = _utc_now_iso()
+    logger.info("Google Tasks: full backfill loaded %d task rows.", len(present))
+
+
+def incremental_fetch(service: Any, state: dict[str, Any], stats: dict[str, int] | None = None) -> Iterator[dict[str, Any]]:
+    if stats is None:
+        stats = {}
+    stats.clear()
+    stats.update(scanned=0, skipped=0, failed=0, deleted=0)
+
+    updated_min = state.get("last_updated_min")
+    known_ids = set(state.get("known_ids", []))
+    if not updated_min:
+        yield from full_backfill(service, state, stats)
+        return
+
+    newest_update = updated_min
+    for tasklist in _list_tasklists(service):
+        tasklist_id = tasklist.get("id")
+        tasklist_title = tasklist.get("title") or ""
+        if not tasklist_id:
+            continue
+        for task in _list_tasks(
+            service,
+            tasklist_id,
+            updated_min=updated_min,
+            show_deleted=True,
+            show_hidden=True,
+        ):
+            stats["scanned"] = stats.get("scanned", 0) + 1
+            row = _task_to_row(task, tasklist_id, tasklist_title)
+            if row is None:
+                stats["skipped"] = stats.get("skipped", 0) + 1
+                continue
+            task_id = row["id"]
+            if row.get("_deleted"):
+                known_ids.discard(task_id)
+                stats["deleted"] = stats.get("deleted", 0) + 1
+                yield {"id": task_id, "_deleted": True}
+                continue
+            known_ids.add(task_id)
+            parsed_updated = _parse_rfc3339(task.get("updated"))
+            if parsed_updated and parsed_updated.isoformat() > newest_update:
+                newest_update = parsed_updated.isoformat()
+            yield row
+
+    state["known_ids"] = sorted(known_ids)
+    state["last_updated_min"] = newest_update
+    logger.info("Google Tasks: incremental sync yielded %d changed task rows.", len(known_ids))
+
+
+def google_tasks_source(
+    *,
+    resource_name: str = "google_tasks_tasks",
+    check_active: Callable[[], None] | None = None,
+    credentials_path: str = "credentials.json",
+    token_path: str = "token.json",
+    service: Any = None,
+):
+    """Return a dlt resource that yields Google Tasks rows for ``remember``."""
+    try:
+        import dlt
+    except ImportError as exc:
+        raise ImportError(
+            "The Google Tasks connector requires the google-tasks extra: "
+            'pip install "cognee[google-tasks]".'
+        ) from exc
+
+    if getattr(dlt_utils, "DOCUMENT_SYNC_VERSION", 0) < 1:
+        raise RuntimeError(
+            "Google Tasks sync requires a Cognee build with table-scoped DLT document cleanup. "
+            "Upgrade Cognee before syncing to avoid deleting another task dataset's documents."
+        )
+
+    stats: dict[str, int] = {}
+
+    @dlt.resource(
+        name=resource_name,
+        primary_key="id",
+        write_disposition="merge",
+        columns={"_deleted": {"data_type": "bool", "hard_delete": True}},
+    )
+    def google_tasks_rows():
+        client = service or build_tasks_service(credentials_path=credentials_path, token_path=token_path)
+        resource_state = dlt.current.resource_state()
+        if resource_state.get("last_updated_min"):
+            rows = incremental_fetch(client, resource_state, stats)
+        else:
+            rows = full_backfill(client, resource_state, stats)
+        yield from dlt_utils.guarded_rows(rows, check_active)
+
+    resource = google_tasks_rows()
+    setattr(resource, DOCUMENT_SOURCE_ATTR, "google_tasks")
+    setattr(resource, dlt_utils.PIPELINE_SCOPE_ATTR, resource_name)
+    resource.cognee_sync_stats = stats
+    return resource
+
+
+__all__ = [
+    "build_tasks_service",
+    "build_tasks_service_from_access_token",
+    "google_tasks_source",
+]
+
+    """
+
+    
+    """
